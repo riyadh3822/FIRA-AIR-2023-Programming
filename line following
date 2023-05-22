@@ -1,0 +1,565 @@
+import rospy
+import tf
+import cv2
+import numpy as np
+from geometry_msgs.msg import Pose, PoseStamped, Twist, Quaternion
+from mavros_msgs.msg import OverrideRCIn
+from mavros_msgs.msg import RCIn
+from mavros_msgs.srv import CommandBool
+from mavros_msgs.srv import SetMode
+from mavros_msgs.srv import CommandTOL
+from dronekit import connect, VehicleMode, LocationGlobal, LocationGlobalRelative
+from pymavlink import mavutil
+from flight_assist_2 import *
+#from scan import *
+
+pi_2 = 3.141592654 / 2.0
+
+vehicle = connect('udp:127.0.0.1:14550',wait_ready=False,baud=57600)
+class MavController:
+    """
+    A simple object to help interface with mavros
+    """
+    def __init__(self):
+
+        rospy.init_node("mav_control_node")
+        rospy.Subscriber("/mavros/local_position/pose", PoseStamped, self.pose_callback)
+        rospy.Subscriber("/mavros/rc/in", RCIn, self.rc_callback)
+
+        self.cmd_pos_pub = rospy.Publisher("/mavros/setpoint_position/local", PoseStamped, queue_size=1)
+        self.cmd_vel_pub = rospy.Publisher("/mavros/setpoint_velocity/cmd_vel_unstamped", Twist, queue_size=1)
+        self.rc_override = rospy.Publisher("/mavros/rc/override", OverrideRCIn, queue_size=1)
+
+        # mode 0 = STABILIZE
+        # mode 4 = GUIDED
+        # mode 9 = LAND
+        self.mode_service = rospy.ServiceProxy('/mavros/set_mode', SetMode)
+        self.arm_service = rospy.ServiceProxy('/mavros/cmd/arming', CommandBool)
+        self.takeoff_service = rospy.ServiceProxy('/mavros/cmd/takeoff', CommandTOL)
+
+        self.rc = RCIn()
+        self.pose = Pose()
+        self.timestamp = rospy.Time()
+
+    def rc_callback(self, data):
+        """
+        Keep track of the current manual RC values
+        """
+        self.rc = data
+
+    def pose_callback(self, data):
+        """
+        Handle local position information
+        """
+        self.timestamp = data.header.stamp
+        self.pose = data.pose
+
+    def goto(self, pose):
+        """
+        Set the given pose as a the next setpoint by sending
+        a SET_POSITION_TARGET_LOCAL_NED message. The copter must
+        be in GUIDED mode for this to work.
+        """
+        pose_stamped = PoseStamped()
+        pose_stamped.header.stamp = self.timestamp
+        pose_stamped.pose = pose
+
+        self.cmd_pos_pub.publish(pose_stamped)
+
+    def goto_xyz_rpy(self, x, y, z, ro, pi, ya):
+        pose = Pose()
+        pose.position.x = x
+        pose.position.y = y
+        pose.position.z = z
+
+        quat = tf.transformations.quaternion_from_euler(ro, pi, ya + pi_2)
+
+        pose.orientation.x = quat[0]
+        pose.orientation.y = quat[1]
+        pose.orientation.z = quat[2]
+        pose.orientation.w = quat[3]
+        self.goto(pose)
+        #print(quat)
+
+    def set_vel(self, vx, vy, vz, avx=0, avy=0, avz=0):
+        """
+        Send comand velocities. Must be in GUIDED mode. Assumes angular
+        velocities are zero by default.
+        """
+        cmd_vel = Twist()
+
+        cmd_vel.linear.x = vx
+        cmd_vel.linear.y = vy
+        cmd_vel.linear.z = vz
+
+        cmd_vel.angular.x = avx
+        cmd_vel.angular.y = avy
+        cmd_vel.angular.z = avz
+
+        self.cmd_vel_pub.publish(cmd_vel)
+
+    def arm(self):
+        """
+        Arm the throttle
+        """
+        return self.arm_service(True)
+
+    def disarm(self):
+        """
+        Disarm the throttle
+        """
+        return self.arm_service(False)
+
+    def takeoff(self, height=1.0):
+        """
+        Arm the throttle, takeoff to a few feet, and set to guided mode
+        """
+        # Set to stabilize mode for arming
+        #mode_resp = self.mode_service(custom_mode="0")
+        mode_resp = self.mode_service(custom_mode="4")
+        self.arm()
+
+        # Set to guided mode
+        #mode_resp = self.mode_service(custom_mode="4")
+
+        # Takeoff
+        takeoff_resp = self.takeoff_service(altitude=height)
+
+        #return takeoff_resp
+        return mode_resp
+
+    def land(self):
+        """
+        Set in LAND mode, which should cause the UAV to descend directly,
+        land, and disarm.
+        """
+        resp = self.mode_service(custom_mode="9")
+        self.disarm()
+        
+def threshold(img):
+    hsv = cv2.cvtColor(img,cv2.COLOR_BGR2HSV)
+    upper = np.array([hsvval[0],hsvval[1],hsvval[2]])
+    lower = np.array([hsvval[3],hsvval[4],hsvval[5]])
+    mask = cv2.inRange(hsv, upper, lower)
+    return mask
+
+def getcountours(thres,img):
+    cx = 0
+    contours , hieracrhy = cv2.findContours(thres, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if len(contours) != 0:
+        biggest=max(contours,key=cv2.contourArea)
+        cv2.drawContours(img,contours,-1,(255,0,255),7)
+        x,y,w,h = cv2.boundingRect(biggest)
+        cx = x+w //2
+        cy = y+h //2
+        cv2.circle(img,(cx,cy),10,(0,255,0),cv2.FILLED)
+    return cx
+
+def getsensoroutput(thres, sensor):
+    imgs= np.hsplit(thres,sensor)
+    totalpixel = (img.shape[1]//sensor)*img.shape[0]
+    threshold = 0.2
+    output = []
+    for x, im in enumerate(imgs):
+        pixelcount = cv2.countNonZero(im)
+        if pixelcount > threshold * totalpixel:
+            output.append(1)
+        else:
+            output.append(0)
+        cv2.imshow(str(x),im)
+    print(output)
+    return output
+
+def command(vehicle,output, cx):
+    #print("HOHO")
+    #TRANSLATION = kanan atau kiri
+    kanankiri = (cx - width//2)//sensitivitas
+    kanankiri = int(np.clip(kanankiri,-10,10))
+    vy = float(kanankiri) // 10
+    vx = 0.2
+    vz = 0
+    
+    if kanankiri<2 and kanankiri > -2:
+        vy = 0
+    
+    arah = 1
+    sudut = 0
+    
+    #ROTASI
+    if output == [1,0,0]:
+        #condition_yaw(vehicle,335,-1, relative=False)
+        arah = -1
+        sudut = 358
+        print("kiri bet")
+        #rospy.sleep(10)
+
+    elif output == [1,1,0]:
+        #condition_yaw(vehicle,345,-1, relative=False)
+        arah = -1
+        sudut = 359
+        print("kiri doang")
+        #rospy.sleep(10)
+
+    elif output == [0,1,0]:
+        #masukin vx,vc,vy
+        arah = 1
+        sudut = 0
+        print("maju")
+        #rospy.sleep(5)
+        #time.sleep(5)
+
+    elif output == [0,1,1]:
+        #condition_yaw(vehicle,15,1, relative=False)
+        arah = 1
+        sudut = 1
+        print("kanan doang")
+        #rospy.sleep(10)
+
+    elif output == [0,0,1]:
+        #condition_yaw(vehicle,25,1, relative=False)
+        arah = 1
+        sudut = 2
+        print("kanan poll")
+        #rospy.sleep(10)
+
+    elif output == [0,0,0]:
+        #keadaan stop
+        arah = 1
+        sudut = 0
+        print("maju")
+        #time.sleep(5)
+
+    elif output == [1,1,1]:
+        #keadaan stop
+        arah = 1
+        sudut = 0
+        print("stop")
+        #time.sleep(5)
+
+    elif output == [1,0,1]:
+        #keadaan stop
+        arah = 1
+        sudut = 0
+        print("stop")
+        #time.sleep(5)
+    
+    condition_yaw(vehicle,sudut,arah, relative=False)
+    
+    
+    send_velocity(vehicle, vx, vy, vz, 1)
+    
+
+    
+cap = cv2.VideoCapture(0)
+hsvval = [0,0,0,360,255,50]
+#cap.set(cv2.CAP_PROP_FRAME_WIDTH,640)
+#cap.set(cv2.CAP_PROP_FRAME_HEIGHT,480)
+width, height = 480,360
+sensor = 3
+sensitivitas = 3  #semakin tinggi semakin lemah sensinya
+
+def simple_demo():
+    """
+    A simple demonstration of using mavros commands to control a UAV.
+    """
+    c = MavController()
+    rospy.sleep(1)
+
+    print("Takeoff")
+    c.takeoff(3)
+    rospy.sleep(5)
+    #c.goto_xyz_rpy(0,0,1.2,0,0,0)
+    #rospy.sleep(3)
+    #opencam(vehicle)
+    rospy.sleep(5)
+    
+    while True:
+        _,img = cap.read()
+        img = cv2.resize(img, (width,height))
+
+        thres = threshold(img)
+        cx = getcountours(thres,img)
+        output = getsensoroutput(thres, sensor)
+        kanankiri = (cx - width//2)//sensitivitas
+        kanankiri = int(np.clip(kanankiri,-10,10))
+        vy = 0
+        vx = 0.2
+        vz = 0
+        
+        if kanankiri<2 and kanankiri > -2:
+            vy = 0
+        
+        arah = 1
+        sudut = 0
+        send_velocity(vehicle, 0, 0, vz, 1)
+        #ROTASI
+        if output == [1,0,0]:
+            #condition_yaw(vehicle,335,-1, relative=False)
+            arah = -1
+            sudut = 358
+            print("kiri bet")
+            send_velocity(vehicle, 0, 0, vz, 1)
+            condition_yaw(vehicle,sudut,arah, relative=False)
+            
+            #rospy.sleep(10)
+
+        elif output == [1,1,0]:
+            #condition_yaw(vehicle,345,-1, relative=False)
+            arah = -1
+            sudut = 359
+            print("kiri doang")
+            send_velocity(vehicle, 0, 0, vz, 1)
+            condition_yaw(vehicle,sudut,arah, relative=False)
+            
+            #rospy.sleep(10)
+
+        elif output == [0,1,0]:
+            #masukin vx,vc,vy
+            arah = 1
+            sudut = 0
+            print("maju")
+            send_velocity(vehicle, vx, vy, vz, 1)
+            
+            #rospy.sleep(5)
+            #time.sleep(5)
+
+        elif output == [0,1,1]:
+            #condition_yaw(vehicle,15,1, relative=False)
+            arah = 1
+            sudut = 1
+            print("kanan doang")
+            send_velocity(vehicle, 0, 0, vz, 1)
+            condition_yaw(vehicle,sudut,arah, relative=False)
+            
+            
+            #rospy.sleep(10)
+
+        elif output == [0,0,1]:
+            #condition_yaw(vehicle,25,1, relative=False)
+            arah = 1
+            sudut = 2
+            print("kanan poll")
+            send_velocity(vehicle, 0, 0, vz, 1)
+            condition_yaw(vehicle,sudut,arah, relative=False)
+            
+            #rospy.sleep(10)
+
+        elif output == [0,0,0]:
+            #keadaan stop
+            arah = 1
+            sudut = 0
+            print("maju")
+            send_velocity(vehicle, vx, vy, vz, 1)
+            
+            #time.sleep(5)
+
+        elif output == [1,1,1]:
+            #keadaan stop
+            arah = 1
+            sudut = 0
+            print("stop")
+            send_velocity(vehicle, 0, 0, vz, 1)
+            
+            #time.sleep(5)
+
+        elif output == [1,0,1]:
+            #keadaan stop
+            arah = 1
+            sudut = 0
+            print("stop")
+            send_velocity(vehicle, 0, 0, vz, 1)
+            #time.sleep(5)
+        
+        #condition_yaw(vehicle,sudut,arah, relative=False)
+        
+        
+        
+
+        cv2.imshow("layar",img)
+        cv2.imshow("masking",thres)
+
+        if cv2.waitKey(1) == ord("q"):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+    
+    '''
+    print("Waypoint 1: position control")
+    c.goto_xyz_rpy(0.0,0.0,1.2,0,0,-1*pi_2)
+    rospy.sleep(2)
+    c.goto_xyz_rpy(0.4,0.0,1.2,0,0,-1*pi_2)
+    rospy.sleep(3)
+    print("Waypoint 2: position control")
+    c.goto_xyz_rpy(0.4,0.0,1.2,0,0,0)
+    rospy.sleep(2)
+    c.goto_xyz_rpy(0.4,0.4,1.2,0,0,0)
+    rospy.sleep(3)
+    print("Waypoint 3: position control")
+    c.goto_xyz_rpy(0.4,0.4,1.2,0,0,pi_2)
+    rospy.sleep(2)
+    c.goto_xyz_rpy(0.0,0.4,1.2,0,0,pi_2)
+    rospy.sleep(3)
+    print("Waypoint 4: position control")
+    c.goto_xyz_rpy(0.0,0.4,1.2,0,0,2*pi_2)
+    rospy.sleep(2)
+    c.goto_xyz_rpy(0.0,0.0,1.2,0,0,2*pi_2)
+    rospy.sleep(3)
+
+    #print("Velocity Setpoint 1")
+    #c.set_vel(0,0.1,0)
+    #rospy.sleep(5)
+    #print("Velocity Setpoint 2")
+    #c.set_vel(0,-0.1,0)
+    #rospy.sleep(5)
+    #print("Velocity Setpoint 3")
+    #c.set_vel(0,0,0)
+    #rospy.sleep(5)'''
+
+    print("Landing")
+    c.land()
+
+if __name__=="__main__":
+    c = MavController()
+    rospy.sleep(1)
+
+    print("Takeoff")
+    c.takeoff(1)
+    rospy.sleep(5)
+    c.goto_xyz_rpy(0,0,1,0,0,0)
+    rospy.sleep(5)
+    kepala=vehicle.heading
+    #opencam(vehicle)
+    
+    while True:
+        _,img = cap.read()
+        img = cv2.resize(img, (width,height))
+
+        thres = threshold(img)
+        cx = getcountours(thres,img)
+        output = getsensoroutput(thres, sensor)
+        kanankiri = (cx - width//2)//sensitivitas
+        kanankiri = int(np.clip(kanankiri,-10,10))
+        vy = float(kanankiri)//10
+        vx = 0.2
+        vz = 0
+        
+        if kanankiri<2 and kanankiri > -2:
+            vy = 0
+        
+        arah = 1
+        sudut = 0
+        #send_velocity(vehicle, 0, 0, vz, 0.1)
+        #ROTASI
+        if output == [1,0,0]:
+            #condition_yaw(vehicle,335,-1, relative=False)
+            arah = -1
+            sudut = 345
+            print("kiri bet")
+            kepala -= 5
+            send_velocity(vehicle, 0, 0, vz, 1)
+            condition_yaw(vehicle,kepala,-1, relative=False)
+            #time.sleep(5)
+            
+
+        elif output == [1,1,0]:
+            #condition_yaw(vehicle,345,-1, relative=False)
+            arah = -1
+            sudut = 350
+            kepala -= 2
+            print("kiri doang")
+            send_velocity(vehicle, 0, 0, vz, 1)
+            condition_yaw(vehicle,kepala,-1, relative=False)
+            #time.sleep(5)
+            
+            
+        elif output == [0,1,0]:
+            #masukin vx,vc,vy
+            arah = 1
+            sudut = 0
+            print("maju")
+            send_velocity(vehicle, vx, vy, vz, 1)
+           
+            
+
+        elif output == [0,1,1]:
+            #condition_yaw(vehicle,15,1, relative=False)
+            arah = 1
+            sudut = 10
+            kepala += 2
+            print("kanan doang")
+            send_velocity(vehicle, 0, 0, vz, 1)
+            condition_yaw(vehicle,kepala,1, relative=False)
+            #time.sleep(5)
+            
+
+        elif output == [0,0,1]:
+            #condition_yaw(vehicle,25,1, relative=False)
+            arah = 1
+            sudut = 15
+            kepala += 5
+            print("kanan poll")
+            send_velocity(vehicle, 0, 0, vz, 1)
+            condition_yaw(vehicle,kepala,1, relative=False)
+            #time.sleep(5)
+            
+
+        elif output == [0,0,0]:
+            #keadaan stop
+            arah = 1
+            sudut = 0
+            print("maju")
+            send_velocity(vehicle, vx, vy, vz, 1)
+            
+
+        elif output == [1,1,1]:
+            #keadaan stop
+            arah = 1
+            sudut = 0
+            print("stop")
+            send_velocity(vehicle, 0, 0, vz, 1)
+            
+
+        elif output == [1,0,1]:
+            #keadaan stop
+            arah = 1
+            sudut = 0
+            print("stop")
+            send_velocity(vehicle, 0, 0, vz, 1)
+            #time.sleep(5)
+
+        cv2.imshow("layar",img)
+        cv2.imshow("masking",thres)
+
+        if cv2.waitKey(1) == ord("q"):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+    
+    print("Landing")
+    c.land()
+    
+    '''c = MavController()
+    rospy.sleep(1)
+
+    print("Takeoff")
+    c.takeoff(3)
+    rospy.sleep(5)
+    #c.goto_xyz_rpy(0,0,1.2,0,0,0)
+    #rospy.sleep(3)
+    #opencam(vehicle)
+    print("Waypoint 1: position control")
+    c.goto_xyz_rpy(0.0,0.0,1.2,0,0,-1*pi_2)
+    rospy.sleep(2)
+    c.goto_xyz_rpy(0.0,0.0,1.2,0,0,-1*pi_2)
+    rospy.sleep(3)
+    
+    print("Waypoint 2: position control")
+    c.goto_xyz_rpy(2.0,0.0,1.2,0,0,-1*pi_2)
+    rospy.sleep(2)
+    c.goto_xyz_rpy(2.0,0.0,1.2,0,0,-1*pi_2)
+    rospy.sleep(3)
+    
+    print("Landing")
+    c.land()'''
